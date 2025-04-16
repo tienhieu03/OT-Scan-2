@@ -1,0 +1,108 @@
+**Phần mềm: OT Manager – Quản lý chấm công và OT bằng thẻ từ**
+
+---
+
+### 1. Mục tiêu
+Xây dựng phần mềm desktop bằng Python nhận thẻ từ qua thiết bị đọc, quản lý dữ liệu nhân viên từ file Excel và ghi log OT theo tháng.
+
+---
+
+### 2. Thiết bị đầu vào
+- Thiết bị đọc thẻ từ: **ZKTeco CR20E**
+- Loại kết nối: USB (HID Keyboard Mode)
+- Tự động giống như gõ bàn phím CARD ID khi quẹt thẻ
+- KHÔNG dùng giao tiếp Serial hay COM Port → KHÔNG cần `pyserial`
+- **Hỗ trợ nhiều thiết bị ZKTeco CR20E cùng lúc trên 1 máy**: phần mềm phân biệt và nhận dữ liệu từ nhiều thiết bị nhập HID khác nhau.
+
+---
+
+### 3. Database nhân viên (Excel .xlsx)
+- Tên file: `employee_database.xlsx`
+- Cấu trúc:
+  | STT | Họ tên | ID | CARD ID |
+
+---
+
+### 4. Chức năng xử lý khi quẹt thẻ
+- Khi quẹt CARD ID (thiết bị sẽ "gõ" chuỗi số và nhấn Enter):
+  - **Nếu CARD ID đã có trong database**:
+    - Hiển thị thông tin: Họ tên, ID, thời gian hiện tại
+    - Kiểm tra delay 1 phút để loại bỏ quẹt liên tiếp
+    - Chỉ chấp nhận quẹt trong khoảng **15 phút trước giờ vào**
+    - Quẹt đầu trong ngày: ghi là **giờ vào**
+    - Quẹt lần 2 trong ngày: ghi là **giờ ra**
+      - Tính giờ làm: giờ ra - giờ vào (chỉ tính từ giờ bắt đầu ca)
+      - Giờ OT = tổng thời gian - giờ chính
+      - **Nếu vượt hạn mức OT trong tháng**: không ghi OT, hiển thông báo
+  - **Nếu CARD ID chưa có**:
+    - Hiện hộp thoại nhập ID nhân viên và Họ tên
+    - Lưu CARD ID, ID, Họ tên vào database
+
+---
+
+### 5. File log OT theo tháng (Excel)
+- Tên file: `OT_Log_Thang_MM_YYYY.xlsx`
+- Cấu trúc:
+  - 3 dòng/mỗi nhân viên:
+    - Dòng 1: Giờ Vào
+    - Dòng 2: Giờ Ra
+    - Dòng 3: Tổng thời gian (phút hoặc giờ)
+  - Cột:
+    | STT | Họ tên | ID | Ngày 1 | Ngày 2 | ... | Ngày 31 |
+
+---
+
+### 6. Cài đặt (Tab Settings)
+- Cài đặt ca làm:
+  - Nhập giờ bắt đầu và giờ kết thúc
+  - Ví dụ: 08:00 – 17:00
+  - **Chỉ nhận quẹt trong 15 phút trước giờ bắt đầu ca**
+- Chọn folder:
+  - Nơi lưu file database nhân viên
+  - Nơi lưu file log OT
+- Cài delay quẹt thẻ: mặc định 1 phút
+- **Nút tạo sheet tháng tiếp theo**: tự động tạo file log OT mới khi sang tháng
+- **Tự động backup file database và file log OT mỗi khi mở phần mềm**
+
+---
+
+### 7. Giao diện chính
+- Hiển thị:
+  - CARD ID
+  - Họ tên, ID
+  - Giờ hiện tại
+  - Trạng thái: Đã vào / Đã ra / OT đủ tháng
+  - Log danh sách quẹt gần nhất
+
+---
+
+### 8. Quy tắc OT
+- Mỗi nhân viên tối đa **1000 giờ OT/năm**
+- Hệ thống tự động chia đều thành **hạn mức OT 83 giờ/tháng**
+- Nếu OT trong tháng > 83 giờ: không ghi OT, cảnh báo
+
+---
+
+### 9. Tính tự động hoá cao
+- Phần mềm hoạt động gần như **tự động hoàn toàn**, chỉ cần thao tác khi:
+  - Thêm nhân viên mới (quẹt lần đầu)
+  - Thêm ca làm hoặc thay đổi giờ
+  - Xuất file log OT tháng
+- Sau khi đã cài đặt đủ các thông tin cần thiết, chỉ cần mở phần mềm và để đó, hệ thống tự nhận thẻ 24/24.
+
+---
+
+### 10. Kỹ thuật
+- Python 3.x
+- Thư viện: `tkinter` / `customtkinter`, `pandas`, `openpyxl`, `datetime`
+- KHÔNG cần `pyserial` do thiết bị ZKTeco CR20E gửi dữ liệu qua HID
+- Chạy 24/24
+- Hỗ trợ nhận nhiều thiết bị ZKTeco CR20E song song
+- Gợi ý chia module:
+  1. CardReaderHandler
+  2. EmployeeDatabaseManager
+  3. AttendanceLogger
+  4. OTLogManager
+  5. UIManager
+  6. SettingsManager
+
