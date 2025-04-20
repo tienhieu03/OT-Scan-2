@@ -19,7 +19,7 @@ USE_SIMULATOR = False # Set to False to use real HID handler
 
 # --- Logging Setup ---
 log_format = '%(asctime)s - %(levelname)s - %(name)s - %(message)s'
-log_level = logging.INFO # Change to logging.DEBUG for more details
+log_level = logging.DEBUG # Change to logging.DEBUG for more details
 # Create a logs directory if it doesn't exist
 log_dir = "app_logs"
 os.makedirs(log_dir, exist_ok=True)
@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 class Application:
     def __init__(self):
         logger.info("Initializing OT Manager Application...")
-        self.hid_queue = queue.Queue()
+        # self.hid_queue = queue.Queue()
 
         # Initialize Managers
         self.settings_manager = SettingsManager() # Load settings first
@@ -55,7 +55,7 @@ class Application:
             settings_manager=self.settings_manager,
             employee_manager=self.employee_manager,
             ot_log_manager=self.ot_log_manager,
-            hid_queue=self.hid_queue
+            #hid_queue=self.hid_queue
         )
         logger.info("UI Manager initialized.")
 
@@ -70,6 +70,7 @@ class Application:
         logger.info("Attendance Manager initialized.")
 
         # Conditional Handler Initialization
+        '''
         self.hid_handler = None
         if USE_SIMULATOR:
             self.hid_handler = SimulatorHidHandler(self.hid_queue)
@@ -98,19 +99,33 @@ class Application:
                 logger.error("Real HID handling currently only supported on Windows with pywinusb.")
                 messagebox.showwarning("Không tương thích", "Đọc thẻ HID thật chỉ hỗ trợ trên Windows.\nChuyển sang chế độ Simulator nếu muốn tiếp tục.")
                 self.ui_manager.update_hid_status("Không hỗ trợ trên OS này")
-
+'''     
+        self.ui_manager.after(100,lambda: self.ui_manager.update_input_status("Sẵn sàng nhận thẻ (Cửa sổ cần được ấn vào)"))
         self._perform_backups()
         self.ui_manager.protocol("WM_DELETE_WINDOW", self.on_closing)
+        
 
     def on_closing(self):
         logger.info("Close request received. Shutting down...")
         # Now messagebox is defined because of the import at the top
         if messagebox.askokcancel("Thoát", "Bạn có chắc chắn muốn thoát OT Manager?"):
-            # ... (rest of the shutdown code) ...
-            logger.info("Destroying UI...")
-            self.ui_manager.destroy()
-            logger.info("Application shutdown complete.")
-            sys.exit() # Ensure process terminates fully
+
+            logger.warning("Forcing Exit")
+            sys.exit(0)
+            '''
+            try:
+                self.employee_manager.save_database()
+            except Exception as e:
+                logger.error(f"Erro saving database on exit: {e}")
+            try:
+                self.ot_log_manager.save_log()
+            except Exception as e:
+                logger.error(f"Error saving OT log on exit: {e}")
+                logger.info(f"Destroying UI...")
+                self.ui_manager.destroy()
+                logger.info(f"Application shutdown complete.")
+                sys.exit()
+            '''
         else:
              logger.info("Shutdown cancelled by user.")
 
@@ -129,6 +144,7 @@ class Application:
 
     def run(self):
         logger.info("Starting application...")
+        '''
         if self.hid_handler:
             self.hid_handler.start()
             # Give HID handler a moment to find devices initially
@@ -137,6 +153,7 @@ class Application:
             self.ui_manager.update_hid_status("Đang chạy...") # Or update based on find result
         else:
              self.ui_manager.update_hid_status("Lỗi - Không thể đọc thẻ")
+            '''
 
         self.ui_manager.run() # Starts the Tkinter main loop
 
@@ -157,4 +174,4 @@ if __name__ == "__main__":
         # Optionally show an error to the user here if folder creation fails
 
     app = Application()
-    app.run()
+    app.run()   

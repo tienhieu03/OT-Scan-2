@@ -11,17 +11,17 @@ import queue
 logger = logging.getLogger(__name__)
 
 class UIManager(ctk.CTk):
-    def __init__(self, attendance_manager, settings_manager, employee_manager, ot_log_manager, hid_queue):
+    def __init__(self, attendance_manager, settings_manager, employee_manager, ot_log_manager):
         super().__init__()
 
         self.attendance_manager = attendance_manager
         self.settings_manager = settings_manager
         self.employee_manager = employee_manager
         self.ot_log_manager = ot_log_manager
-        self.hid_queue = hid_queue
+        #self.hid_queue = hid_queue
 
         self.title(config.APP_TITLE)
-        self.geometry("800x750") # Increased height further for VID/PID
+        self.geometry("800x700") # Increased height further for VID/PID
         ctk.set_appearance_mode("System")
         ctk.set_default_color_theme("blue")
 
@@ -42,9 +42,10 @@ class UIManager(ctk.CTk):
         self._update_settings_widgets_state()
 
         # Start polling the HID queue
-        self.after(100, self._check_hid_queue)
+        #self.after(100, self._check_hid_queue)
         # Start clock update
         self._update_clock()
+        self.after(250,self._refocus_hidden_entry)
 
     def _create_widgets(self):
         self.grid_columnconfigure(0, weight=1)
@@ -152,7 +153,6 @@ class UIManager(ctk.CTk):
         self.save_settings_button = ctk.CTkButton(edit_save_frame, text="Lưu Tất Cả Cài Đặt", command=self._save_settings)
         self.save_settings_button.grid(row=0, column=2, padx=5, pady=5, sticky="e")
 
-
         # --- Settings Tab 3: Log Actions ---
         log_actions_tab = tab_view.tab("Thao tác Log")
         log_actions_tab.grid_columnconfigure(0, weight=1)
@@ -163,19 +163,60 @@ class UIManager(ctk.CTk):
         self.status_bar = ctk.CTkLabel(self, text="Clock: --:--:-- | HID Status: Initializing...", anchor="w")
         self.status_bar.grid(row=4, column=0, padx=10, pady=(0,5), sticky="ew") # Adjust row
 
+        self.hidden_swipe_entry = ctk.CTkEntry(self, width = 1, height = 1, border_width= 0, fg_color=self.cget("fg_color"))
+        self.hidden_swipe_entry.grid(row=5,column=0,sticky = "w", padx=0, pady=0)
+        self.grid_rowconfigure(5,weight=0)
+        self.hidden_swipe_entry.bind("<Return>",self._on_swipe_input)
+
     def _update_clock(self):
         """Updates the clock in the status bar every second."""
         now = datetime.now().strftime("%H:%M:%S")
         current_status_text = self.status_bar.cget("text")
-        hid_part = current_status_text.split("|")[-1].strip()
-        self.status_bar.configure(text=f"Clock: {now} | {hid_part}")
+        input_part = current_status_text.split("|")[-1].strip()
+        self.status_bar.configure(text=f"Clock: {now} | {input_part}")
         self.after(1000, self._update_clock)
+
+    def update_input_status(self, status_message):
+        current_status_text = self.status_bar.cget("text")
+        clock_part = current_status_text.split("|")[0].strip()
+        self.status_bar.configure(text=f"{clock_part} | Input status: {status_message}")
 
     def update_hid_status(self, status_message):
          """Updates the HID status part of the status bar."""
          current_status_text = self.status_bar.cget("text")
          clock_part = current_status_text.split("|")[0].strip()
          self.status_bar.configure(text=f"{clock_part} | HID Status: {status_message}")
+
+    def _refocus_hidden_entry(self):
+        try:
+            self.hidden_swipe_entry.focus_set()
+            logger.debug("Focus set to hidden swipe entry.")
+        except Exception as e:
+            logger.error(f"Error setting focus to hidden entry: {e}")
+
+    def _on_swipe_input(self, event = None):
+        card_id = self.hidden_swipe_entry.get().strip()
+        logger.info("Swipe input receiveed: '{card_id}'")
+        self.hidden_swipe_entry.delete(0,ctk.END)
+        if card_id:
+            employee = self.employee_manager.find_employee_by_card_id(card_id)
+            if not employee:
+                name, emp_id = self.ask_new_employee_info(card_id)
+                if name and emp_id:
+                    success, msg = self.employee_manager.add_employee(name,emp_id,card_id)
+                    if success:
+                        messagebox.showinfo("Thành công", f"Đã thêm nhân viên:\nTên: {name}\nID:{emp_id}\nCARD_ID:{card_id}")
+                        self.attendance_manager.process_swipe(card_id)
+                    else:
+                        messagebox.showerror("Lỗi",f"Không thể thêm nhân viên: {msg}")
+                        self.update_display(status=f"Lỗi thêm NV({card_id})",card_id=card_id)
+                else:
+                    self.update_display(status=f"Đã hủy đăng ký thẻ ({card_id})",card_id = card_id)
+            else:
+                self.attendance_manager.process_swipe(card_id)
+        else:
+            logger.warning("Empty input receive on Enter press.")
+        self.after(50,self._refocus_hidden_entry)
 
     def _load_settings_to_ui(self):
         # Clear existing content
@@ -195,8 +236,8 @@ class UIManager(ctk.CTk):
         # Load VID/PID settings (display as hex)
         vid = self.settings_manager.get_setting("zkteco_vid", config.DEFAULT_ZKTeco_VID)
         pid = self.settings_manager.get_setting("zkteco_pid", config.DEFAULT_ZKTeco_PID)
-        self.vid_entry.insert(0, hex(vid)) # Display as hex string e.g., "0x1b55"
-        self.pid_entry.insert(0, hex(pid)) # Display as hex string e.g., "0xb502"
+        self.vid_entry.insert(0, f"0x{vid:04X}") # Display as hex string e.g., "0x1b55"
+        self.pid_entry.insert(0, f"0x{pid:04X}") # Display as hex string e.g., "0xb502"
 
 
     def _update_settings_widgets_state(self):
@@ -280,11 +321,20 @@ class UIManager(ctk.CTk):
 
         # Reload dependent components (DB/Log paths might have changed)
         try:
+            logger.info("Reloading employee database after setting save...")
             self.employee_manager._load_database()
-            self.ot_log_manager._load_log_for_date(datetime.now())
+            logger.info("Reloading current OT log file after setting save...")
+            current_log_path = self.ot_log_manager._get_log_filepath(datetime.now())
+
+            self.ot_log_manager._load_log_file(current_log_path)
+
+            logger.info(f"Successfully reloaded log file: {current_log_path}")
+        except Exception as ae:
+             logger.error(f"AttributeError reloading data after settings change: {ae}",exc_info = True)
+             messagebox.showwarning("Lỗi Tải Dữ liệu", f"Đã lưu cài đặt, nhưng có lỗi khi tải lại dữ liệu:\n{ae}\n\nVui lòng khởi động lại ứng dụng nếu gặp sự cố.")
         except Exception as e:
-             logger.error(f"Error reloading data after settings change: {e}")
-             messagebox.showwarning("Lỗi Tải Dữ liệu", f"Đã lưu cài đặt, nhưng có lỗi khi tải lại dữ liệu:\n{e}\n\nVui lòng khởi động lại ứng dụng nếu gặp sự cố.")
+            logger.error(f"Error reloading data after setting change: {e}",exc_info=True)
+            messagebox.showwarning("Lỗi tải dữ liệu", f"Đã lưu cài đặt, nhưng có lỗi khi tải tại dữ liệu:\n{e}\n\nVui lòng khởi động lại ứng dụng nếu gặp sự cố.")
 
         # --- User Feedback ---
         messagebox.showinfo("Thành công", "Đã lưu cài đặt.\n\nLƯU Ý: Nếu bạn đã thay đổi VID/PID, cần khởi động lại ứng dụng để thay đổi có hiệu lực.")
@@ -378,8 +428,6 @@ class UIManager(ctk.CTk):
                  name = name_input # Valid name
 
         return name, emp_id
-
-
     def _check_hid_queue(self):
         """Periodically check the queue for new card IDs from the HID handler."""
         try:
@@ -409,6 +457,6 @@ class UIManager(ctk.CTk):
             pass
         finally:
             self.after(100, self._check_hid_queue)
-
     def run(self):
         self.mainloop()
+

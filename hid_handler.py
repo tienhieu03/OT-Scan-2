@@ -23,6 +23,11 @@ KEYCODE_MAP = {
     0x5E: '6', 0x5F: '7', 0x60: '8', 0x61: '9', 0x62: '0', # Numpad numbers
 }
 logger = logging.getLogger(__name__)
+
+# --- define HID Usage constants for Keyboard ---
+HID_USAGE_PAGE_GENERIC_DESKTOP = 0x01
+HID_USAGE_ID_KEYBOARD = 0x06
+
 # --- Important ---
 # How raw data is structured depends heavily on the HID device's report descriptor.
 # This handler assumes a standard keyboard-like report where:
@@ -48,7 +53,7 @@ class HidHandler:
 
     def _raw_data_handler(self, data, device_path):
         """Callback function for pywinusb."""
-        # logger.debug(f"Raw data from {device_path}: {data}")
+        logger.debug(f"Raw data from {device_path}: {data}")
 
         # Check if it's a key release event (typically all zeros after byte 1 or 2)
         # Check bytes 2 onwards for keycodes
@@ -69,7 +74,7 @@ class HidHandler:
                 char = KEYCODE_MAP.get(key_code)
                 if char:
                     processed_char = char
-                    # logger.debug(f"Device {device_path}: Keycode {key_code:02X} -> Char '{char}'")
+                    logger.debug(f"Device {device_path}: Keycode {key_code:02X} -> Char '{char}'")
                     break # Process only the first detected key per report for simplicity
 
         # Update last key data only if it wasn't a release
@@ -89,27 +94,45 @@ class HidHandler:
 
     def _find_devices(self):
         """Find devices based on self.target_vid and self.target_pid."""
-        all_devices = hid.find_all_hid_devices()
+
+        target_interface_str = "&mi_00"
+
+        try:
+            device_filter = hid.HidDeviceFilter(vendor_id = self.target_vid,product_id = self.target_pid,usage_page = HID_USAGE_PAGE_GENERIC_DESKTOP,
+            usage_id = HID_USAGE_ID_KEYBOARD)
+            hid_filtered_devices = device_filter.get_devices()
+        except Exception as filter_e:
+            logger.error(f"Error creatig or applying HID device filter: {filter_e}",exc_info = True)
+            hid_filtered_devices = []
+
         self.devices = []
         found_paths = set()
 
-        if not all_devices:
-            logger.warning("No HID devices found.")
+        if not hid_filtered_devices:
+            logger.warning("No HID devices found matching VID = 0x{self.target_vid:04X},PID = 0x{self.target_pid:04X} AND Usage = Keyboard(0x{HID_USAGE_PAGE_GENERIC_DESKTOP:02X}/0x{HID_USAGE_ID_KEYBOARD:02X}.")
             return False
 
-        logger.info(f"Scanning {len(all_devices)} HID devices for VID=0x{self.target_vid:04X}, PID=0x{self.target_pid:04X}...")
-        for device in all_devices:
+        logger.info(f"Found {len(hid_filtered_devices)} devices matching VID/PID/Usage. Now filtering for interface '{target_interface_str}'...")
+        for device in hid_filtered_devices:
             try:
-                if device.vendor_id == self.target_vid and device.product_id == self.target_pid:
-                    logger.info(f"Found matching device: '{device.product_name}' at {device.device_path}")
-                    if device.device_path not in found_paths:
-                         self.devices.append(device)
-                         found_paths.add(device.device_path)
-                    else:
-                         logger.debug(f"Skipping duplicate device path: {device.device_path}")
+                device_path = device.device_path
+
+                if target_interface_str in device_path:
+                    logger.info(f"Found matching Keyboard interface:'{target_interface_str}':'{device.product_name}' at {device.device_path}") 
+                if device_path not in found_paths:
+                    self.devices.append(device)
+                    found_paths.add(device.device_path)
+                    logger.debug(f"Added device path: {device_path}")
+                else:
+                    logger.debug(f"Skipping device path does not contain '{target_interface_str}': {device_path}")
+                    if device.is_plugged() and hasattr(device, 'close'):
+                        try:
+                            pass
+                        except Exception as close_e:
+                            logger.warning(f"Could not close non-selected device {device_path}: {close_e}")
             except Exception as e:
-                logger.error(f"Error processing device {device.device_path}: {e}")
-                if device and hasattr(device, 'close') and callable(device.close): # Check if closable
+                logger.error(f"Error processing filtered device {getattr(device, 'device_path', 'N/A')}: {e}")
+                if device and hasattr(device, 'is_plugged') and hasattr(device, 'close'): # Check if closable
                     try:
                         device.close()
                     except Exception as close_e:
@@ -117,36 +140,42 @@ class HidHandler:
 
 
         if not self.devices:
-            logger.warning(f"No devices found matching VID=0x{self.target_vid:04X} and PID=0x{self.target_pid:04X}.")
+            logger.warning(f"Could not find any device matching VID/PID/Usage AND containing '{target_interface_str}' in its path")
+            logger.warning(f"Please verify the device path in Device Manager and the '{target_interface_str}' string.")
             return False
 
-        logger.info(f"Found {len(self.devices)} matching reader(s).")
+        logger.info(f"Found {len(self.devices)} device interface(s) matching all criteria (including '{target_interface_str}').")
         return True
 
 
     def _run(self):
         """Worker thread function."""
         while self.running:
-            if not self.devices or not all(d.is_plugged() for d in self.devices):
+            devices_connected = self.devices and all(d.is_plugged() for d in self.devices)
+
+            if not devices_connected:
                 logger.info("Attempting to find/reconnect ZKTeco devices...")
-                # Close any existing open devices before searching again
                 for dev in self.devices:
                     if dev.is_opened():
+                        logger.info(f"Closing previously opened device: {dev.device_path}")
                         dev.close()
                 self.devices = []
-                self.device_buffers.clear() # Clear buffers on reconnect
+                self.device_buffers.clear()
                 self.device_last_key_data.clear()
-
                 if self._find_devices():
                     try:
+                        all_opened = True
                         for device in self.devices:
-                            device.open()
-                            # Assign the handler using a lambda to capture the device_path
-                            device.set_raw_data_handler(lambda data, dp=device.device_path: self._raw_data_handler(data, dp))
-                            logger.info(f"Opened device and set handler for: {device.device_path}")
+                            if not device.is_opened():
+                                logger.info(f"Opening device: {device.device_path}")
+                                device.open()
+                                logger.info(f"Setting raw data handler for: {device.device_path}")
+                                device.set_raw_data_handler(lambda data, dp=device.device_path: self._raw_data_handler(data, dp))
+                                logger.info(f"Handler set successfully for:{ device.device_path}")
+                            else:
+                                logger.warning(f"Device already open? {device.device_path}")
                     except Exception as e:
-                        logger.error(f"Error opening device or setting handler: {e}")
-                        # Close devices that failed to open properly
+                        logger.error(f"Error opening device for setting handler: {e}",exc_info=True)
                         for dev in self.devices:
                             if dev.is_opened():
                                 dev.close()
@@ -161,14 +190,12 @@ class HidHandler:
             # Keep thread alive while devices are connected and handlers are set
             # pywinusb handles callbacks in its own internal mechanism when device is open
             time.sleep(1) # Check connection status periodically
-
         # Cleanup when stopping
         logger.info("HID handler stopping. Closing devices.")
         for device in self.devices:
             if device.is_opened():
                 device.close()
         logger.info("HID handler stopped.")
-
 
     def start(self):
         if not self.running:

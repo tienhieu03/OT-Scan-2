@@ -16,6 +16,10 @@ class AttendanceManager:
         self.last_swipe_times = {} # {card_id: datetime}
         self.todays_attendance = {} # {card_id: {'in': datetime, 'out': datetime, 'date': date}}
         self.processed_today = set() # {card_id} - To prevent reprocessing 'out' if app restarts mid-day
+    
+    def process_swipe(self,card_id):
+        self._reset_daily_state_if_needed()
+        now=datetime.now()
 
     def _reset_daily_state_if_needed(self):
         """Checks if the date has changed and resets daily tracking."""
