@@ -1,0 +1,666 @@
+
+Okay, this is a significant and very useful enhancement! Integrating the work schedule adds a crucial layer of validation. Here's how we can implement this:
+1. New Configuration:
+We need a setting to store the path to this schedule Excel file.
+We need to define the mapping between the codes used in the schedule ('1', '2', '3', 'D', 'D1', 'WH', 'SO', 'PH', etc.) and the shift names used in our application settings ("Ca 1", "Ca 2", "Ca 3", "Hành chính") or identify them as non-working days.
+2. New Module: WorkScheduler
+This module will be responsible for reading the schedule Excel file and providing the assigned shift for a given employee on a specific date.
+3. Modify AttendanceManager:
+It will use the WorkScheduler to get the employee's assigned shift for the day of the swipe.
+It will reject swipes if:
+The employee is not scheduled to work that day (e.g., 'WH', 'SO', 'PH').
+The swipe time does not fall within the allowed window of their specifically assigned shift.
+OT calculation will be based only on the assigned shift's start/end times.
+Let's Implement:
+Step 1: Update config.py
+# config.py
+# ... (other imports and settings) ...
+
+# --- NEW: Schedule File Configuration ---
+DEFAULT_SCHEDULE_FILENAME = "schedule.xlsx" # Default name if not set
+# Mapping from schedule codes to application shift names (or None for non-working)
+# Adjust keys ('1', '2', '3', 'D') based on EXACTLY what's in the Excel file cells
+# Adjust values ('Ca 1', 'Ca 2', 'Ca 3', 'Hành chính') based on EXACTLY what's used as keys in settings["shifts"]
+DEFAULT_SCHEDULE_CODE_MAP = {
+    "1": "Ca 1",
+    "2": "Ca 2",
+    "3": "Ca 3",
+    "D": "Hành chính",
+    "D1": "Hành chính", # Assuming D1 is also Hành chính, adjust if needed
+    "HC": "Hành chính", # Add other possible codes if used
+    # Codes that mean "Not scheduled to work" -> map to None
+    "WH": None,
+    "SO": None,
+    "PH": None,
+    "SL": None, # Special Leave
+    "CH": None, # Company Holiday / Nghỉ bù
+    "AWD": None, # Normal Working Day (???) - Clarify if this code means a specific shift or just 'work'
+                 # If AWD means 'work Hành chính', map it: "AWD": "Hành chính"
+                 # If AWD means 'work assigned shift elsewhere', this needs more complex logic
+                 # For now, let's assume AWD might mean Hành chính if no other number is present? Or treat as None? Let's treat as None for now.
+}
+# ---
+
+# --- Dynamic Paths ---
+# ... (other path functions) ...
+
+def get_schedule_filepath(settings_mgr):
+    # Use setting if available, otherwise default relative to BASE_PATH
+    folder = settings_mgr.get_setting("database_folder", DEFAULT_DATA_FOLDER) # Store schedule with DB? Or separate setting? Let's use DB folder for now.
+    filename = settings_mgr.get_setting("schedule_filename", DEFAULT_SCHEDULE_FILENAME)
+    return os.path.join(folder, filename)
+Use code with caution.
+Python
+Step 2: Update settings_manager.py
+Add settings for the schedule file name and the code map.
+# settings_manager.py
+# ... (imports) ...
+
+class SettingsManager:
+    # ... (__init__) ...
+
+    def _load_settings(self):
+        defaults = {
+            "shifts": config.DEFAULT_SHIFTS,
+            "swipe_delay_minutes": config.DEFAULT_SWIPE_DELAY_MINUTES,
+            "database_folder": config.DEFAULT_DATA_FOLDER,
+            "log_folder": os.path.join(config.DEFAULT_DATA_FOLDER, config.DEFAULT_LOG_FOLDER_NAME),
+            "backup_folder": config.DEFAULT_BACKUP_FOLDER,
+            "allowed_swipe_window_minutes": config.DEFAULT_ALLOWED_SWIPE_WINDOW_MINUTES,
+            "zkteco_vid": config.DEFAULT_ZKTeco_VID,
+            "zkteco_pid": config.DEFAULT_ZKTeco_PID,
+            # --- NEW Settings ---
+            "schedule_filename": config.DEFAULT_SCHEDULE_FILENAME,
+            "schedule_code_map": config.DEFAULT_SCHEDULE_CODE_MAP,
+            # ---
+        }
+        # ... (rest of loading logic, ensuring keys exist) ...
+        # Add validation if needed for schedule_code_map structure
+        if os.path.exists(self.filepath):
+             try:
+                # ... (load json) ...
+                # Ensure base keys exist
+                settings_updated = False
+                for key, value in defaults.items():
+                    if key not in loaded_settings:
+                        # ... (add default) ...
+                        settings_updated = True
+
+                # --- Basic validation for schedule_code_map ---
+                if "schedule_code_map" not in loaded_settings or not isinstance(loaded_settings.get("schedule_code_map"), dict):
+                     logger.warning("Setting 'schedule_code_map' missing or not a dictionary. Reverting to default.")
+                     loaded_settings["schedule_code_map"] = config.DEFAULT_SCHEDULE_CODE_MAP
+                     settings_updated = True
+                # ---
+
+                # ... (validate shifts structure) ...
+
+                if settings_updated:
+                     self.settings = loaded_settings
+                     self.save_settings()
+
+                return loaded_settings
+             except Exception as e: # Broad exception for loading issues
+                 logger.error(f"Error loading settings from '{self.filepath}': {e}. Using default settings.", exc_info=True)
+                 self.settings = defaults
+                 return defaults
+        else:
+            # ... (create new settings file) ...
+            logger.warning(f"Settings file '{self.filepath}' not found. Creating with defaults.")
+            self.settings = defaults
+            self.save_settings()
+            return defaults
+
+
+    # ... (get_setting, set_setting, save_settings) ...
+
+    def get_schedule_code_map(self):
+        """Returns the dictionary mapping schedule codes to shift names."""
+        return self.get_setting("schedule_code_map", config.DEFAULT_SCHEDULE_CODE_MAP)
+
+    # ... (other getter methods: get_swipe_delay, get_allowed_swipe_window, get_shifts_config) ...
+Use code with caution.
+Python
+Step 3: Create work_scheduler.py
+# work_scheduler.py
+import pandas as pd
+import os
+import logging
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+class WorkScheduler:
+    def __init__(self, settings_manager):
+        self.settings_manager = settings_manager
+        self.schedule_filepath = None
+        self.df_schedule = None
+        self.date_columns = {} # Cache mapping from day number to actual column name
+        self.employee_id_col = "Mã nhân viên" # Adjust if column name is different
+        self.first_date_col_index = 5 # Column F is index 5 (0-based) - Adjust if layout changes
+        self.load_schedule() # Load on initialization
+
+    def _find_schedule_file(self):
+        """Gets the schedule file path from settings."""
+        # Use the dynamic path function from config
+        try:
+            return config.get_schedule_filepath(self.settings_manager)
+        except Exception as e:
+            logger.error(f"Error getting schedule file path: {e}", exc_info=True)
+            return None
+
+    def load_schedule(self):
+        """Loads the schedule data from the Excel file specified in settings."""
+        filepath = self._find_schedule_file()
+        if not filepath:
+            logger.error("Schedule filepath not configured or found.")
+            self.schedule_filepath = None
+            self.df_schedule = None
+            return False
+
+        if filepath == self.schedule_filepath and self.df_schedule is not None:
+            logger.debug("Schedule already loaded and path hasn't changed.")
+            return True # No need to reload if path is same
+
+        logger.info(f"Attempting to load schedule file: {filepath}")
+        try:
+            # Find the header row dynamically - look for "Mã nhân viên"
+            # This requires reading the file once to find the header
+            temp_df_for_header = pd.read_excel(filepath, header=None) # Read without header first
+            header_row_index = None
+            for idx, row in temp_df_for_header.iterrows():
+                if self.employee_id_col in row.values:
+                    header_row_index = idx
+                    break
+
+            if header_row_index is None:
+                logger.error(f"Could not find header row containing '{self.employee_id_col}' in '{filepath}'.")
+                self.schedule_filepath = None
+                self.df_schedule = None
+                return False
+
+            logger.info(f"Found header row at index {header_row_index}. Reading schedule...")
+            # Now read the file properly using the found header row
+            self.df_schedule = pd.read_excel(
+                filepath,
+                header=header_row_index,
+                dtype={self.employee_id_col: str} # Ensure employee ID is read as string
+            )
+            # Remove potential empty rows loaded before header if any
+            self.df_schedule.dropna(subset=[self.employee_id_col], inplace=True)
+
+            # --- Cache Date Columns ---
+            self.date_columns = {}
+            schedule_cols = self.df_schedule.columns.tolist()
+            if len(schedule_cols) > self.first_date_col_index:
+                for col_name in schedule_cols[self.first_date_col_index:]:
+                    try:
+                        # Extract day number from columns like "01-Thg4", "02-Thg4", etc.
+                        day_str = str(col_name).split('-')[0]
+                        day_num = int(day_str)
+                        self.date_columns[day_num] = col_name
+                    except (ValueError, IndexError):
+                        logger.warning(f"Could not parse day number from schedule column: '{col_name}'. Skipping.")
+            logger.debug(f"Cached date columns: {self.date_columns}")
+            # ---
+
+            self.schedule_filepath = filepath
+            logger.info(f"Successfully loaded schedule from: {filepath}")
+            return True
+
+        except FileNotFoundError:
+            logger.error(f"Schedule file not found: {filepath}")
+            self.schedule_filepath = None
+            self.df_schedule = None
+            return False
+        except Exception as e:
+            logger.error(f"Error loading schedule file '{filepath}': {e}", exc_info=True)
+            self.schedule_filepath = None
+            self.df_schedule = None
+            return False
+
+    def get_assigned_shift_code(self, employee_id, target_date):
+        """
+        Gets the raw shift code (e.g., '1', 'WH', 'SO') for the employee on the target date.
+        Returns the code as a string, or None if not found/not loaded.
+        """
+        if self.df_schedule is None:
+            logger.warning("Schedule not loaded, cannot get assigned shift.")
+            # Optionally try reloading here?
+            # if not self.load_schedule(): return None
+            return None
+
+        day_num = target_date.day
+        if day_num not in self.date_columns:
+            logger.warning(f"Day {day_num} not found in schedule columns cache.")
+            return None # Date column doesn't exist for this day
+
+        date_col_name = self.date_columns[day_num]
+        employee_id_str = str(employee_id).strip()
+
+        try:
+            # Find the row corresponding to the employee ID
+            employee_row = self.df_schedule[self.df_schedule[self.employee_id_col] == employee_id_str]
+
+            if employee_row.empty:
+                logger.warning(f"Employee ID '{employee_id_str}' not found in schedule.")
+                return None
+
+            # Get the value from the specific date column for that employee
+            # Use .iloc[0] because filtering might return a DataFrame row
+            shift_code = employee_row.iloc[0][date_col_name]
+
+            # Handle potential NaN or empty values
+            if pd.isna(shift_code):
+                logger.warning(f"No shift code found for Emp ID {employee_id_str} on {target_date.strftime('%Y-%m-%d')} (Day {day_num}, Col '{date_col_name}').")
+                return None
+
+            # Convert to string for consistent handling
+            shift_code_str = str(shift_code).strip()
+            # Handle cases where pandas might read '1' as 1.0
+            if shift_code_str.endswith(".0"):
+                shift_code_str = shift_code_str[:-2]
+
+            logger.debug(f"Found shift code '{shift_code_str}' for Emp ID {employee_id_str} on {target_date.strftime('%Y-%m-%d')}")
+            return shift_code_str
+
+        except KeyError:
+            logger.warning(f"Column '{date_col_name}' or '{self.employee_id_col}' not found in schedule DataFrame (should not happen if loaded correctly).")
+            return None
+        except Exception as e:
+            logger.error(f"Error retrieving shift code for Emp ID {employee_id_str} on {target_date.strftime('%Y-%m-%d')}: {e}", exc_info=True)
+            return None
+Use code with caution.
+Python
+Step 4: Update ui_manager.py
+Add an option to select the schedule file.
+# ui_manager.py
+# ... (imports) ...
+
+class UIManager(ctk.CTk):
+    # ... (__init__) ...
+
+    def _create_widgets(self):
+        # ... (other tabs) ...
+
+        # --- Settings Tab 1: General Settings ---
+        settings_tab_general = tab_view.tab("Cài đặt Chung")
+        settings_tab_general.grid_columnconfigure(1, weight=1)
+
+        # ... (Swipe Delay, Swipe Window entries) ...
+
+        # --- Add Schedule File Selection ---
+        ctk.CTkLabel(settings_tab_general, text="File Lịch làm việc:").grid(row=2, column=0, padx=10, pady=5, sticky="w")
+        self.schedule_file_label = ctk.CTkLabel(settings_tab_general, text="...", width=300, anchor="w")
+        self.schedule_file_label.grid(row=2, column=1, padx=10, pady=5, sticky="ew")
+        self.schedule_file_button = ctk.CTkButton(settings_tab_general, text="Chọn...", command=self._select_schedule_file, width=80)
+        self.schedule_file_button.grid(row=2, column=2, padx=5, pady=5)
+        # --- Shift existing rows down ---
+        ctk.CTkLabel(settings_tab_general, text="Thư mục Database NV:").grid(row=3, column=0, padx=10, pady=5, sticky="w") # Was row 2
+        self.db_folder_label.grid(row=3, column=1, padx=10, pady=5, sticky="ew")
+        self.db_folder_button.grid(row=3, column=2, padx=5, pady=5)
+        ctk.CTkLabel(settings_tab_general, text="Thư mục Log OT:").grid(row=4, column=0, padx=10, pady=5, sticky="w") # Was row 3
+        self.log_folder_label.grid(row=4, column=1, padx=10, pady=5, sticky="ew")
+        self.log_folder_button.grid(row=4, column=2, padx=5, pady=5)
+        # ---
+
+        # ... (other tabs: Shifts, Device, Log Actions) ...
+
+        # --- Edit Switch and Save Button (Common) ---
+        # ... (remains the same) ...
+
+        # --- Bottom Status Bar ---
+        # ... (remains the same) ...
+
+        # --- Hidden Swipe Entry ---
+        # ... (remains the same) ...
+
+    def _load_settings_to_ui(self):
+        # ... (clear entries) ...
+
+        # Load General settings
+        # ... (load delay, window) ...
+        self.db_folder_label.configure(text=self.settings_manager.get_setting("database_folder", config.DEFAULT_DATA_FOLDER))
+        self.log_folder_label.configure(text=self.settings_manager.get_setting("log_folder", os.path.join(config.DEFAULT_DATA_FOLDER, config.DEFAULT_LOG_FOLDER_NAME)))
+        # --- Load Schedule Filename ---
+        schedule_folder = self.settings_manager.get_setting("database_folder", config.DEFAULT_DATA_FOLDER) # Assuming it's in DB folder
+        schedule_filename = self.settings_manager.get_setting("schedule_filename", config.DEFAULT_SCHEDULE_FILENAME)
+        self.schedule_file_label.configure(text=os.path.join(schedule_folder, schedule_filename))
+        # ---
+
+        # ... (load device settings) ...
+        # ... (load shift settings) ...
+
+    def _update_settings_widgets_state(self):
+        # ... (enable/disable other widgets) ...
+        # --- Add schedule button ---
+        self.schedule_file_button.configure(state=new_state)
+        # ---
+        # ... (rest of the method) ...
+
+    # --- NEW Method to select schedule file ---
+    def _select_schedule_file(self):
+        # Assume schedule is in the same folder as DB for initial dir
+        initial_dir = self.settings_manager.get_setting("database_folder", config.DEFAULT_DATA_FOLDER)
+        filepath = filedialog.askopenfilename(
+            title="Chọn File Lịch làm việc Excel",
+            initialdir=initial_dir,
+            filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")]
+        )
+        if filepath:
+            # Store only the filename in settings, assume it's in the DB folder
+            folder, filename = os.path.split(filepath)
+            self.settings_manager.set_setting("database_folder", folder) # Update folder setting too
+            self.settings_manager.set_setting("schedule_filename", filename)
+            # Update the label immediately
+            self.schedule_file_label.configure(text=filepath)
+            self.db_folder_label.configure(text=folder) # Keep DB folder label consistent
+            logger.info(f"Schedule file selected: {filepath}")
+            # Note: Actual saving happens on "Save Settings" button click
+
+    # ---
+
+    def _save_settings(self):
+        # ... (validate other settings: delay, window, shifts, device) ...
+
+        # --- Get schedule settings (already updated by _select_schedule_file) ---
+        # No extra validation needed here unless you want to check file existence again
+        schedule_filename = self.settings_manager.get_setting("schedule_filename")
+        if not schedule_filename:
+             messagebox.showerror("Lỗi Giá Trị", "Cài đặt Chung:\nChưa chọn File Lịch làm việc.")
+             return
+
+        # --- All Validations Passed - Save Settings ---
+        # ... (save delay, window, db folder, log folder, vid, pid, shifts) ...
+        # Schedule filename and folder are already set in settings_manager via _select_schedule_file
+
+        self.settings_manager.save_settings()
+
+        # Reload dependent components
+        try:
+            # ... (reload employee db, reload ot log) ...
+            # --- Reload Schedule ---
+            logger.info("Reloading work schedule after settings save...")
+            # Access scheduler via attendance_manager or pass it to UI? Pass via attendance_manager is cleaner.
+            if hasattr(self.attendance_manager, 'work_scheduler') and self.attendance_manager.work_scheduler:
+                 schedule_reloaded = self.attendance_manager.work_scheduler.load_schedule()
+                 if schedule_reloaded:
+                      logger.info("Work schedule reloaded successfully.")
+                 else:
+                      logger.error("Failed to reload work schedule after saving settings.")
+                      messagebox.showwarning("Lỗi Tải Lịch", "Đã lưu cài đặt, nhưng không thể tải lại File Lịch làm việc. Kiểm tra đường dẫn và file.")
+            else:
+                 logger.warning("WorkScheduler not found in AttendanceManager during reload.")
+            # ---
+            # ... (reload shifts in AttendanceManager) ...
+        except Exception as e:
+             # ... (error handling) ...
+             pass
+
+        # --- User Feedback ---
+        # ... (show success message) ...
+
+        # Disable editing mode
+        # ... (disable editing) ...
+
+    # ... (rest of UIManager) ...
+Use code with caution.
+Python
+Step 5: Update attendance_manager.py
+Integrate the WorkScheduler.
+# attendance_manager.py
+from datetime import datetime, timedelta, time, date
+import config
+import logging
+from operator import itemgetter
+
+# --- Import WorkScheduler ---
+from work_scheduler import WorkScheduler
+# ---
+
+logger = logging.getLogger(__name__)
+
+class AttendanceManager:
+    def __init__(self, settings_manager, employee_manager, ot_log_manager, ui_update_callback):
+        self.settings_manager = settings_manager
+        self.employee_manager = employee_manager
+        self.ot_log_manager = ot_log_manager
+        self.ui_update_callback = ui_update_callback
+
+        # --- Instantiate WorkScheduler ---
+        self.work_scheduler = WorkScheduler(self.settings_manager)
+        # ---
+
+        self.last_swipe_times = {}
+        self.todays_attendance = {}
+        self.processed_today = set()
+        self.shifts = {}
+        self.schedule_code_map = {} # Cache the code map
+        self.load_shifts_and_map() # Combined loading
+
+    def load_shifts_and_map(self):
+        """Loads shifts and schedule code map from settings."""
+        logger.info("Loading shifts and schedule map configuration...")
+        # Load shifts (same as before)
+        shifts_config = self.settings_manager.get_shifts_config()
+        self.shifts = {}
+        for name, data in shifts_config.items():
+             try:
+                 start_time_obj = datetime.strptime(data['start'], "%H:%M").time()
+                 end_time_obj = datetime.strptime(data['end'], "%H:%M").time()
+                 self.shifts[name] = {
+                     "start_time": start_time_obj, "end_time": end_time_obj,
+                     "start_str": data['start'], "end_str": data['end']
+                 }
+             except (ValueError, KeyError) as e:
+                 logger.error(f"Error parsing shift '{name}' data {data}: {e}. Skipping.")
+        logger.info(f"Loaded {len(self.shifts)} shifts.")
+        # Load schedule code map
+        self.schedule_code_map = self.settings_manager.get_schedule_code_map()
+        logger.info(f"Loaded schedule code map: {self.schedule_code_map}")
+
+
+    # Renamed load_shifts to load_shifts_and_map, update call in _save_settings in UI Manager if needed
+    # Or keep load_shifts and add load_schedule_map separately
+
+    # ... (_get_shift_datetime_objects remains the same) ...
+
+    # --- Remove _determine_shift_for_swipe - Logic moves to process_swipe ---
+    # def _determine_shift_for_swipe(self, swipe_time): ...
+
+    def process_swipe(self, card_id):
+        self._reset_daily_state_if_needed()
+        now = datetime.now()
+        today = now.date()
+        card_id = str(card_id).strip()
+
+        logger.info(f"Processing swipe for CARD ID: {card_id} at {now}")
+
+        # 1. Check Swipe Delay
+        # ... (delay check) ...
+        swipe_delay = self.settings_manager.get_swipe_delay()
+        last_swipe = self.last_swipe_times.get(card_id)
+        if last_swipe and (now - last_swipe) < swipe_delay:
+            logger.warning(f"Swipe rejected for {card_id}: Too soon after last swipe.")
+            self.ui_update_callback(status=f"Quẹt quá nhanh ({card_id})", card_id=card_id)
+            return
+        self.last_swipe_times[card_id] = now
+
+        # 2. Find Employee
+        employee_info = self.employee_manager.find_employee_by_card_id(card_id)
+        if not employee_info:
+            logger.warning(f"Card ID {card_id} not found. Triggering registration.")
+            self.ui_update_callback(status=f"Thẻ mới: {card_id}. Cần đăng ký.", card_id=card_id)
+            return
+        emp_name = employee_info.get('Họ tên', 'N/A')
+        emp_id = employee_info.get('ID', 'N/A') # Use the ID from the employee DB
+        if not emp_id or emp_id == 'N/A':
+             logger.error(f"Employee found for Card ID {card_id}, but has invalid/missing Employee ID in database.")
+             self.ui_update_callback(status=f"Lỗi ID nhân viên ({emp_name})", card_id=card_id, name=emp_name)
+             return
+        logger.info(f"Employee found: ID={emp_id}, Name={emp_name}")
+
+        # --- 3. Get Assigned Shift from Schedule ---
+        assigned_shift_code = self.work_scheduler.get_assigned_shift_code(emp_id, today)
+        if assigned_shift_code is None:
+            logger.warning(f"No schedule found for Emp ID {emp_id} on {today}. Rejecting swipe.")
+            self.ui_update_callback(status=f"Không có lịch làm việc ({emp_name})", card_id=card_id, name=emp_name, emp_id=emp_id, time=now)
+            return
+
+        # --- 4. Map Code to Shift Name / Check Non-Working ---
+        assigned_shift_name = self.schedule_code_map.get(assigned_shift_code) # Use cached map
+        if assigned_shift_name is None:
+             # Check if the code itself exists in the map (meaning it's a defined non-working code)
+             if assigned_shift_code in self.schedule_code_map:
+                  logger.info(f"Emp ID {emp_id} is scheduled for non-working code '{assigned_shift_code}' on {today}. Rejecting swipe.")
+                  self.ui_update_callback(status=f"Ngày nghỉ ({assigned_shift_code}) ({emp_name})", card_id=card_id, name=emp_name, emp_id=emp_id, time=now)
+                  return
+             else:
+                  # Code not found in map at all
+                  logger.error(f"Unknown shift code '{assigned_shift_code}' found in schedule for Emp ID {emp_id} on {today}. Cannot process swipe.")
+                  self.ui_update_callback(status=f"Mã ca không xác định ({assigned_shift_code}) ({emp_name})", card_id=card_id, name=emp_name, emp_id=emp_id, time=now)
+                  return
+
+        # --- 5. Validate Shift Name and Get Shift Info ---
+        if assigned_shift_name not in self.shifts:
+            logger.error(f"Shift name '{assigned_shift_name}' (from code '{assigned_shift_code}') not found in configured shifts. Check settings.")
+            self.ui_update_callback(status=f"Lỗi cấu hình ca '{assigned_shift_name}' ({emp_name})", card_id=card_id, name=emp_name, emp_id=emp_id, time=now)
+            return
+        assigned_shift_info = self.shifts[assigned_shift_name]
+        logger.info(f"Emp ID {emp_id} assigned shift: '{assigned_shift_name}' (Code: {assigned_shift_code})")
+
+        # --- 6. Validate Swipe Time Against Assigned Shift Window ---
+        try:
+            shift_start_dt, shift_end_dt = self._get_shift_datetime_objects(assigned_shift_info, today)
+            allowed_window = self.settings_manager.get_allowed_swipe_window()
+            earliest_clock_in = shift_start_dt - allowed_window
+            # Allow swipe from earliest check-in up to shift end (or maybe slightly after for clock-out?)
+            # Let's use a grace period for clock-out, e.g., 12 hours after shift end? Or just check if it's after clock-in.
+            # For now, check if swipe is within [earliest_clock_in, shift_end_dt + grace_period]
+            # Simpler: Check if swipe is >= earliest_clock_in for potential clock-in
+            # And check if swipe is > clock_in_time for potential clock-out
+
+            is_valid_time_for_shift = (now >= earliest_clock_in) # Basic check: is it after the earliest allowed time?
+
+            if not is_valid_time_for_shift:
+                 logger.warning(f"Swipe time {now} is too early for assigned shift '{assigned_shift_name}' (Earliest: {earliest_clock_in}). Rejecting.")
+                 self.ui_update_callback(status=f"Quá sớm cho ca '{assigned_shift_name}' ({emp_name})", card_id=card_id, name=emp_name, emp_id=emp_id, time=now)
+                 return
+
+        except Exception as e:
+             logger.error(f"Error validating swipe time against shift '{assigned_shift_name}': {e}", exc_info=True)
+             self.ui_update_callback(status=f"Lỗi kiểm tra giờ ca ({emp_name})", card_id=card_id, name=emp_name, emp_id=emp_id, time=now)
+             return
+        # ---
+
+        # 7. Determine Swipe Type (In or Out) based on memory
+        attendance_record = self.todays_attendance.get(card_id)
+        is_clock_in = False
+        is_clock_out = False
+
+        if not attendance_record or not attendance_record.get('in'):
+            # Potentially a CLOCK IN - Time already validated against assigned shift window start
+            is_clock_in = True
+            logger.info(f"Swipe accepted as CLOCK IN for assigned shift '{assigned_shift_name}' for {emp_id} at {now.strftime('%H:%M:%S')}")
+
+        elif attendance_record.get('in') and not attendance_record.get('out'):
+            # Potentially a CLOCK OUT
+            if now > attendance_record['in']:
+                is_clock_out = True
+                # Use the shift stored at CLOCK IN time
+                clock_in_shift_name = attendance_record.get('shift_name', 'UNKNOWN')
+                # Sanity check: does clock-out shift match clock-in shift? Usually should.
+                if clock_in_shift_name != assigned_shift_name:
+                     logger.warning(f"Clock-out shift determination ('{assigned_shift_name}') differs from clock-in shift ('{clock_in_shift_name}') for Emp ID {emp_id}. Using clock-in shift for calculation.")
+                     # Use the shift name stored when clocking IN for consistency in calculation
+                     assigned_shift_name = clock_in_shift_name
+                     if assigned_shift_name not in self.shifts: # Check again if clock-in shift was invalid
+                          logger.error(f"Invalid shift name '{assigned_shift_name}' stored during clock-in. Cannot calculate OT.")
+                          self.ui_update_callback(status=f"Lỗi ca làm việc đã lưu ({emp_name})", card_id=card_id, name=emp_name, emp_id=emp_id, time=now)
+                          return
+
+                logger.info(f"Swipe accepted as CLOCK OUT for assigned shift '{assigned_shift_name}' for {emp_id} at {now.strftime('%H:%M:%S')}")
+            else:
+                # ... (handle clock out before clock in error) ...
+                logger.warning(f"Clock OUT rejected for {emp_id}: Swipe time ({now}) is not after clock in time ({attendance_record['in']})")
+                self.ui_update_callback(status=f"Lỗi thời gian quẹt ra ({emp_name})", card_id=card_id, name=emp_name, emp_id=emp_id)
+                return
+        else:
+            # ... (handle already clocked in/out) ...
+             logger.info(f"Employee {emp_id} already clocked in and out today. Ignoring swipe.")
+             self.ui_update_callback(status=f"Đã chấm công đủ hôm nay ({emp_name})", card_id=card_id, name=emp_name, emp_id=emp_id)
+             return
+
+        # 8. Record Attendance and Log
+        time_str = now.strftime('%H:%M:%S')
+
+        if is_clock_in:
+            if card_id not in self.todays_attendance:
+                self.todays_attendance[card_id] = {'date': today}
+            self.todays_attendance[card_id]['in'] = now
+            self.todays_attendance[card_id]['shift_name'] = assigned_shift_name # Store assigned shift
+            success = self.ot_log_manager.write_log_entry(employee_info, now, "Giờ Vào", time_str)
+            if success:
+                self.ui_update_callback(status=f"Đã vào ({assigned_shift_name}): {emp_name}", card_id=card_id, name=emp_name, emp_id=emp_id, time=now)
+            else:
+                 self.ui_update_callback(status=f"LỖI GHI LOG Giờ Vào ({emp_name})", card_id=card_id, name=emp_name, emp_id=emp_id, time=now)
+
+        elif is_clock_out:
+            self.todays_attendance[card_id]['out'] = now
+            success = self.ot_log_manager.write_log_entry(employee_info, now, "Giờ Ra", time_str)
+            if success:
+                shift_worked = self.todays_attendance[card_id].get('shift_name') # Get shift from clock-in record
+                if not shift_worked or shift_worked not in self.shifts:
+                     logger.error(f"Cannot calculate OT for {emp_id}: Shift name missing or invalid in attendance record ('{shift_worked}')")
+                     self.ui_update_callback(status=f"Lỗi ca làm việc ({emp_name})", card_id=card_id, name=emp_name, emp_id=emp_id, time=now)
+                     return
+
+                self.ui_update_callback(status=f"Đã ra ({shift_worked}): {emp_name}", card_id=card_id, name=emp_name, emp_id=emp_id, time=now)
+                self._calculate_and_log_ot(card_id, employee_info, now, shift_worked) # Pass shift worked
+            else:
+                 self.ui_update_callback(status=f"LỖI GHI LOG Giờ Ra ({emp_name})", card_id=card_id, name=emp_name, emp_id=emp_id, time=now)
+                 return
+
+    # _calculate_and_log_ot remains the same (already accepts shift_name)
+    # _reset_daily_state_if_needed remains the same
+    # dummy_ui_update remains the same
+Use code with caution.
+Python
+Step 6: Update main.py
+Ensure WorkScheduler is instantiated correctly (it's done within AttendanceManager now). No major changes needed here unless you want to trigger an initial schedule load explicitly or handle scheduler loading errors during startup.
+# main.py
+# ... (imports) ...
+
+class Application:
+    def __init__(self):
+        # ... (Initialize Settings, Employee, OTLog Managers) ...
+
+        # --- AttendanceManager now creates WorkScheduler internally ---
+        self.attendance_manager = AttendanceManager(
+            settings_manager=self.settings_manager,
+            employee_manager=self.employee_manager,
+            ot_log_manager=self.ot_log_manager,
+            ui_update_callback=self.ui_manager.update_display # Pass UI callback
+        )
+        # --- Pass AttendanceManager to UI ---
+        self.ui_manager.attendance_manager = self.attendance_manager
+        logger.info("Attendance Manager (and WorkScheduler) initialized.")
+
+        # ... (rest of init: UI status, backups, protocol) ...
+
+    # ... (run, on_closing, _perform_backups) ...
+
+# ... (Entry Point) ...
+Use code with caution.
+Python
+How to Use:
+Place Schedule File: Put your schedule Excel file (e.g., schedule.xlsx) in the same folder as your employee_database.xlsx (or select its location using the new UI button). Make sure the Employee ID column name matches employee_id_col in work_scheduler.py and the date columns are correctly parsed.
+Configure Mapping: Check/adjust DEFAULT_SCHEDULE_CODE_MAP in config.py to accurately map the codes in your Excel ('1', '2', 'WH', etc.) to the shift names defined in your settings ("Ca 1", "Ca 2", etc.) or None for non-working days.
+Run: Start the application.
+Select File (First Time): Go to "Cài đặt Chung", click "Chọn..." next to "File Lịch làm việc", select your schedule file, and click "Lưu Tất Cả Cài Đặt".
+Test:
+Swipe a card for an employee who is scheduled for "Ca 1" today.
+If the swipe is at 5:50 AM, it should be accepted as "Đã vào (Ca 1)".
+If the swipe is at 2:10 PM (during Ca 2 time), it should be rejected with a message like "Ngoài giờ ca 'Ca 1'".
+Swipe a card for an employee scheduled for 'WH' today. The swipe should be rejected ("Ngày nghỉ (WH)").
+This implementation enforces the schedule read from the Excel file. Remember that the accuracy depends heavily on the correct file path, the structure of the Excel file (header row, column names, date format), and the accuracy of the schedule_code_map.
